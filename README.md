@@ -35,21 +35,22 @@ The keywords **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are
 
 ## 1. The model
 
-Astrel publishes a single JSON **config payload**. SDKs ingest that payload and, given an **evaluation context** (a user and optionally a team), resolve the value of an **aspect**.
+Astrel publishes a single JSON **config payload**. SDKs ingest that payload and, given an **evaluation context** (a single opaque identifier supplied by the host), resolve the value of an **aspect**.
 
 - **Aspect** — a single named piece of configuration (a flag, a value, a JSON blob). Keyed by slug. Has a declared `type` and a `default`.
 - **Trigger** — a global override switch. When active, it forces values for the aspects it lists, for everyone. Used for kill-switches and incident response.
-- **Cohort** — an explicit targeting list. Names specific user IDs or team IDs and the value they should receive.
-- **Lottery** — deterministic percentage rollout. Hashes the identifier into a bucket. Same identifier always lands in the same bucket.
+- **Lottery** — deterministic percentage rollout. Hashes the host-supplied identifier into a bucket. The same identifier always lands in the same bucket.
 - **Default** — the base value when nothing else matches.
 
 Every aspect is resolved through the same fixed order:
 
 ```
-Trigger  →  Cohort  →  Lottery  →  Default
+Trigger  →  Lottery  →  Default
 ```
 
 The first layer that produces a value wins. This order is fixed by the schema description and MUST NOT be configurable.
+
+> **v1 has no explicit per-identifier targeting.** There is no allowlist/cohort layer: an aspect is either globally overridden by a trigger, bucketed by the lottery, or left at its default. "Turn this on for exactly these users" is not expressible in the payload; the host must achieve it another way (its own gating, or a dedicated single-bucket lottery). This is a deliberate v1 scope decision.
 
 ---
 
@@ -86,18 +87,19 @@ SDKs MUST pin to a major-version schema URL. They MUST NOT fetch an unversioned 
 
 ## 4. The evaluation context
 
-Evaluation is driven entirely by the payload plus two runtime inputs. There are no other inputs.
+Evaluation is driven entirely by the payload plus one runtime input. There are no other inputs.
 
 | Input | Type | Required | Used by |
 |-------|------|----------|---------|
-| `user_id` | string | yes | cohorts (scope `user`), lottery (scope `user`) |
-| `team_id` | string | no | cohorts (scope `team`), lottery (scope `team`) |
+| `identifier` | string | for the lottery only | lottery seed (Section 6) |
+
+The `identifier` is an opaque string chosen by the host (a user ID, team ID, account ID, device ID, whatever the host wants the rollout bucketed by). Astrel does not interpret it.
 
 Rules:
 
-- `user_id` MUST be supplied for any evaluation. If it is absent or empty, the SDK MUST return the aspect default (and SHOULD treat this as a usage error worth logging).
-- `team_id` MAY be absent. When a layer is `team`-scoped and `team_id` is absent, that layer MUST be skipped (treated as "no match"), and resolution falls through to the next layer. It MUST NOT throw.
-- Identifiers are opaque strings. The SDK MUST NOT normalise, trim, lowercase, or otherwise transform them. `"User-1"` and `"user-1"` are different identifiers. Cohort membership is exact string equality; lottery seeds are built from the raw string (Section 6).
+- The `identifier` is required only to run the **lottery** layer. If it is absent or empty, the lottery layer MUST be skipped (treated as "no match") and resolution falls through to the default. The SDK MUST NOT throw.
+- **Triggers do not use the identifier.** They are global and evaluate regardless of whether an identifier is supplied (Section 5.1). An aspect with an active trigger override resolves even when no identifier is passed.
+- The identifier is an opaque string. The SDK MUST NOT normalise, trim, lowercase, or otherwise transform it. `"User-1"` and `"user-1"` are different identifiers. The lottery seed is built from the raw string (Section 6).
 
 Triggers take **no** runtime input — their active state lives entirely in the payload (see Section 5.1). The host does not pass trigger state in.
 
@@ -105,7 +107,7 @@ Triggers take **no** runtime input — their active state lives entirely in the 
 
 ## 5. Evaluation engine
 
-To resolve aspect `A` for context `(user_id, team_id)`:
+To resolve aspect `A` for a host-supplied `identifier` (which may be absent):
 
 ### 5.1 Triggers (global overrides)
 
@@ -114,38 +116,30 @@ To resolve aspect `A` for context `(user_id, team_id)`:
 1. If `trigger.active` is `false`, skip it.
 2. If `trigger.aspects` contains a key equal to `A`'s slug, **return that value immediately**.
 
-The first active trigger that overrides `A` wins. Triggers are global: they apply to every context regardless of `user_id` or `team_id`. If no active trigger overrides `A`, fall through.
+The first active trigger that overrides `A` wins. Triggers are global: they apply to every evaluation regardless of the supplied identifier (or its absence). If no active trigger overrides `A`, fall through.
 
 > A trigger's `active` flag is the only thing that gates it, and it is part of the published payload. Flipping a trigger is a publish operation, not a runtime call. This is what makes triggers usable as a kill-switch: publish `active: true` and every SDK forces the override on its next config load.
 
-### 5.2 Cohorts (explicit targeting)
-
-`aspect.cohorts` is an optional array, **ordered by priority** (index 0 is highest). Iterate it in order. For each cohort entry:
-
-1. Determine the scoped identifier: `user_id` if `cohort.scope == "user"`, `team_id` if `cohort.scope == "team"`.
-2. If that identifier is absent (e.g. team-scoped but no `team_id`), skip this entry.
-3. If `cohort.members` contains the scoped identifier (exact string match), **return `cohort.value`**.
-
-First matching cohort wins. If none match, fall through.
-
-Membership is a pre-computed explicit list of IDs in the payload. The SDK does no segmentation logic of its own.
-
-### 5.3 Lottery (deterministic rollout)
+### 5.2 Lottery (deterministic rollout)
 
 If `aspect.lottery` is present, run the lottery (Section 6) and **return the selected bucket's value**. The lottery always produces a value when present (its weights sum to 10000, covering the whole range), so when an aspect has a lottery, resolution never reaches the default for a valid context.
 
 If `aspect.lottery` is absent, fall through.
 
-### 5.4 Default
+### 5.3 Default
 
 Return `aspect.default`. Every aspect declares one; this layer always produces a value.
 
-### 5.5 Worked example
+### 5.4 Worked example
 
 ```jsonc
 {
   "schema_version": 1,
   "published_at": "2026-06-13T10:00:00Z",
+  "lottery": {
+    "algorithm": "sha256_mod10000",
+    "seed_format": "{identifier}:{aspect_slug}"
+  },
   "triggers": [
     { "slug": "incident-freeze", "active": false,
       "aspects": { "new-checkout": false } }
@@ -154,11 +148,7 @@ Return `aspect.default`. Every aspect declares one; this layer always produces a
     "new-checkout": {
       "type": "boolean",
       "default": false,
-      "cohorts": [
-        { "scope": "team", "members": ["team-42"], "value": true }
-      ],
       "lottery": {
-        "scope": "user",
         "buckets": [
           { "value": false, "weight": 5000 },
           { "value": true,  "weight": 5000 }
@@ -169,9 +159,10 @@ Return `aspect.default`. Every aspect declares one; this layer always produces a
 }
 ```
 
-- Context `(user-1, team-42)` → trigger inactive → cohort `team-42` matches → **`true`**.
-- Context `(user-789, team-7)` → trigger inactive → no cohort match → lottery (Section 6 shows `user-789` → point 7064 → bucket `true`) → **`true`**.
-- Same payload but `incident-freeze.active = true` → trigger overrides → **`false`** for everyone, ignoring cohort and lottery.
+- Identifier `user-789` → trigger inactive → lottery (Section 6 shows `user-789:new-checkout` → point 7064 → bucket index 1) → **`true`**.
+- Identifier `user-123` → trigger inactive → lottery (`user-123:new-checkout` → point 1515 → bucket index 0) → **`false`**.
+- No identifier supplied → trigger inactive → lottery skipped → default → **`false`**.
+- Any of the above with `incident-freeze.active = true` → trigger overrides → **`false`** for everyone, identifier irrelevant.
 
 ---
 
@@ -185,15 +176,15 @@ The global `config.lottery.algorithm` declares the algorithm. v1 defines exactly
 
 ### 6.2 Building the seed
 
-The seed template is `{scoped_identifier}:{aspect_slug}`, taken from `config.lottery.seed_format`.
+The seed template is `{identifier}:{aspect_slug}`, taken from `config.lottery.seed_format`.
 
-- `scoped_identifier` is `user_id` if the aspect's `lottery.scope == "user"`, else `team_id`.
+- `identifier` is the opaque string the host passes into the accessor at resolution time (Section 4).
 - `aspect_slug` is the aspect's key.
 - The two are joined with a single ASCII colon `:`.
 
-Example: aspect `new-checkout`, user scope, `user_id = "user-789"` → seed string `user-789:new-checkout`.
+Example: aspect `new-checkout`, `identifier = "user-789"` → seed string `user-789:new-checkout`.
 
-If the lottery is `team`-scoped and `team_id` is absent, the lottery layer is skipped (Section 4) and resolution falls through to the default.
+If no identifier is supplied, the lottery layer is skipped (Section 4) and resolution falls through to the default.
 
 ### 6.3 Hash to a point
 
@@ -205,7 +196,7 @@ If the lottery is `team`-scoped and `team_id` is absent, the lottery layer is sk
 Reference (pseudocode):
 
 ```
-seed   = scoped_identifier + ":" + aspect_slug
+seed   = identifier + ":" + aspect_slug
 digest = SHA256(UTF8(seed))            // 32 bytes
 u32    = (digest[0] << 24) | (digest[1] << 16) | (digest[2] << 8) | digest[3]   // big-endian
 point  = u32 mod 10000                 // 0..9999
@@ -265,7 +256,7 @@ Rules:
 
 - `boolean` → native boolean. `string` → native string. `number` → native numeric (see below). `json` → the parsed object or array.
 - **Number handling**: JSON numbers are double-precision. The SDK MUST preserve numeric value faithfully and SHOULD offer integer and float access where the language distinguishes them. It MUST NOT silently truncate a float to an int.
-- **Type mismatch**: if the resolved value's runtime type does not match the accessor called (e.g. `get_boolean` on a `string` aspect, or a cohort value whose type differs from the aspect's declared `type`), the SDK MUST return the caller's `fallback`, MUST NOT throw, and MUST surface the mismatch via the error channel (Section 8/11).
+- **Type mismatch**: if the resolved value's runtime type does not match the accessor called (e.g. `get_boolean` on a `string` aspect, or a lottery bucket value whose type differs from the aspect's declared `type`), the SDK MUST return the caller's `fallback`, MUST NOT throw, and MUST surface the mismatch via the error channel (Section 8/11).
 - **Unknown slug**: if the aspect is not present in the payload, return the caller's `fallback` (Section 8).
 - A generic/untyped accessor MAY be provided in addition, but the typed accessors are the required surface.
 
@@ -287,8 +278,7 @@ Required behaviour by failure:
 | Unknown aspect slug | Return caller's `fallback`. |
 | Type mismatch at accessor | Return caller's `fallback`, surface error (Section 7). |
 | Unknown lottery `algorithm` | Skip lottery layer, fall through to default, surface error (Section 6.1). |
-| Missing `user_id` | Return default/`fallback`, surface usage error (Section 4). |
-| Missing `team_id` for a team-scoped layer | Skip that layer, fall through (Section 4). |
+| Missing `identifier` | Skip the lottery layer, fall through to default; triggers still apply (they are global). Surface a usage error (Section 4). |
 
 There are two distinct "defaults" and they MUST NOT be conflated:
 
@@ -331,7 +321,7 @@ How an SDK obtains the payload. A production SDK MUST implement a fetch-and-cach
 
 To measure rollouts, SDKs report **exposure events**: a record that a given context was exposed to a given resolved value, and which layer decided it.
 
-- The SDK SHOULD emit an exposure event each time an aspect is evaluated for a context. An exposure event MUST include at least: aspect slug, resolved value (or a stable digest of it), the deciding layer (`trigger` | `cohort` | `lottery` | `default`), the context identifiers used, and a timestamp. When the layer is `trigger` it SHOULD include the trigger slug; when `lottery`, the selected bucket index.
+- The SDK SHOULD emit an exposure event each time an aspect is evaluated for a context. An exposure event MUST include at least: aspect slug, resolved value (or a stable digest of it), the deciding layer (`trigger` | `lottery` | `default`), the identifier used (if any), and a timestamp. When the layer is `trigger` it SHOULD include the trigger slug; when `lottery`, the selected bucket index.
 - Emission MUST be non-blocking and MUST NOT affect the resolved value. Telemetry failure MUST NOT fail evaluation.
 - The SDK SHOULD batch and flush exposures on an interval and on shutdown, with bounded buffering and a drop policy under backpressure (dropping telemetry is always preferable to blocking the host or growing memory unboundedly).
 - The SDK SHOULD de-duplicate repeated identical exposures within a window to control volume, and SHOULD make this configurable.
@@ -356,11 +346,11 @@ Vectors live in this repo (proposed `vectors/`) as JSON so any language can load
 {
   "algorithm": "sha256_mod10000",
   "cases": [
-    { "scoped_identifier": "user-123", "aspect_slug": "new-checkout",   "seed": "user-123:new-checkout",   "u32": 667561515,  "point": 1515 },
-    { "scoped_identifier": "user-456", "aspect_slug": "new-checkout",   "seed": "user-456:new-checkout",   "u32": 1173581668, "point": 1668 },
-    { "scoped_identifier": "user-789", "aspect_slug": "new-checkout",   "seed": "user-789:new-checkout",   "u32": 3985347064, "point": 7064 },
-    { "scoped_identifier": "team-42",  "aspect_slug": "beta-dashboard", "seed": "team-42:beta-dashboard",  "u32": 3993341872, "point": 1872 },
-    { "scoped_identifier": "user-123", "aspect_slug": "beta-dashboard", "seed": "user-123:beta-dashboard", "u32": 3732749424, "point": 9424 }
+    { "identifier": "user-123", "aspect_slug": "new-checkout",   "seed": "user-123:new-checkout",   "u32": 667561515,  "point": 1515 },
+    { "identifier": "user-456", "aspect_slug": "new-checkout",   "seed": "user-456:new-checkout",   "u32": 1173581668, "point": 1668 },
+    { "identifier": "user-789", "aspect_slug": "new-checkout",   "seed": "user-789:new-checkout",   "u32": 3985347064, "point": 7064 },
+    { "identifier": "team-42",  "aspect_slug": "beta-dashboard", "seed": "team-42:beta-dashboard",  "u32": 3993341872, "point": 1872 },
+    { "identifier": "user-123", "aspect_slug": "beta-dashboard", "seed": "user-123:beta-dashboard", "u32": 3732749424, "point": 9424 }
   ]
 }
 ```
@@ -371,16 +361,16 @@ Vectors live in this repo (proposed `vectors/`) as JSON so any language can load
 {
   "payload": { "schema_version": 1, "published_at": "2026-06-13T10:00:00Z", "...": "..." },
   "cases": [
-    { "aspect": "new-checkout", "user_id": "user-1",   "team_id": "team-42", "expected": true,  "via": "cohort" },
-    { "aspect": "new-checkout", "user_id": "user-789", "team_id": "team-7",  "expected": true,  "via": "lottery", "bucket": 1 },
-    { "aspect": "new-checkout", "user_id": "user-1",   "team_id": "team-7",  "expected": false, "via": "default" }
+    { "aspect": "new-checkout", "identifier": "user-789", "expected": true,  "via": "lottery", "bucket": 1 },
+    { "aspect": "new-checkout", "identifier": "user-123", "expected": false, "via": "lottery", "bucket": 0 },
+    { "aspect": "new-checkout", "identifier": "",         "expected": false, "via": "default" }
   ]
 }
 ```
 
 ### 12.2 Required coverage
 
-The suite MUST include cases for: each layer winning in isolation; trigger priority (a lower-priority active trigger NOT overriding a higher one); inactive triggers being skipped; cohort priority (first match wins); cohort scope `user` vs `team`; missing `team_id` skipping team-scoped layers; lottery bucket-boundary cases (a `point` of exactly `0`, exactly one below a boundary, and exactly on a boundary); each aspect `type`; type-mismatch falling back; unknown slug falling back; unknown lottery algorithm failing safe; and `schema_version` too-new being rejected.
+The suite MUST include cases for: each layer winning in isolation; trigger priority (a lower-priority active trigger NOT overriding a higher one); inactive triggers being skipped; a trigger resolving with no identifier supplied (triggers are global); missing identifier skipping the lottery and falling through to default; lottery bucket-boundary cases (a `point` of exactly `0`, exactly one below a boundary, and exactly on a boundary); each aspect `type`; type-mismatch falling back; unknown slug falling back; unknown lottery algorithm failing safe; and `schema_version` too-new being rejected.
 
 ### 12.3 Boundary cases worth pinning explicitly
 
@@ -409,14 +399,14 @@ Language-agnostic surface every SDK SHOULD expose (names idiomatic per language)
 Client.init(options) -> Client            // endpoint, key, poll interval, hooks
 Client.is_ready() -> boolean              // first valid config loaded?
 Client.refresh() -> void | future         // force a fetch
-Client.get_boolean(slug, context, fallback) -> boolean
-Client.get_string(slug, context, fallback)  -> string
-Client.get_number(slug, context, fallback)  -> number
-Client.get_json(slug, context, fallback)    -> object | array
-Client.get_details(slug, context) -> { value, type, via, bucket? }   // for debugging/exposure
+Client.get_boolean(slug, identifier, fallback) -> boolean
+Client.get_string(slug, identifier, fallback)  -> string
+Client.get_number(slug, identifier, fallback)  -> number
+Client.get_json(slug, identifier, fallback)    -> object | array
+Client.get_details(slug, identifier) -> { value, type, via, bucket? }   // for debugging/exposure
 Client.shutdown() -> void | future        // stop polling, flush telemetry
 
-context := { user_id: string, team_id?: string }
+identifier := string   // opaque, host-chosen; optional. omit or empty skips the lottery
 ```
 
 `get_details` (or equivalent) SHOULD return the deciding layer so hosts can debug resolution and so exposure events (Section 11) can be assembled. The typed `get_*` accessors are the required surface; everything else is strongly recommended.
