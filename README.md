@@ -38,19 +38,19 @@ The keywords **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are
 Astrel publishes a single JSON **config payload**. SDKs ingest that payload and, given an **evaluation context** (a single opaque identifier supplied by the host), resolve the value of an **aspect**.
 
 - **Aspect** — a single named piece of configuration (a flag, a value, a JSON blob). Keyed by slug. Has a declared `type` and a `default`.
-- **Trigger** — a global override switch. When active, it forces values for the aspects it lists, for everyone. Used for kill-switches and incident response.
+- **Override** — a per-aspect marker (`overridden`) saying the backend has pinned this aspect to a forced value. When set, the backend has already baked the forced value into `default` and removed the lottery. The SDK does no override logic of its own; it surfaces that the value is forced. Used for kill-switches and incident response.
 - **Lottery** — deterministic percentage rollout. Hashes the host-supplied identifier into a bucket. The same identifier always lands in the same bucket.
 - **Default** — the base value when nothing else matches.
 
 Every aspect is resolved through the same fixed order:
 
 ```
-Trigger  →  Lottery  →  Default
+Override  →  Lottery  →  Default
 ```
 
 The first layer that produces a value wins. This order is fixed by the schema description and MUST NOT be configurable.
 
-> **v1 has no explicit per-identifier targeting.** There is no allowlist/cohort layer: an aspect is either globally overridden by a trigger, bucketed by the lottery, or left at its default. "Turn this on for exactly these users" is not expressible in the payload; the host must achieve it another way (its own gating, or a dedicated single-bucket lottery). This is a deliberate v1 scope decision.
+> **v1 has no explicit per-identifier targeting.** There is no allowlist/cohort layer: an aspect is either pinned by a backend override, bucketed by the lottery, or left at its default. "Turn this on for exactly these users" is not expressible in the payload; the host must achieve it another way (its own gating, or a dedicated single-bucket lottery). This is a deliberate v1 scope decision.
 
 ---
 
@@ -98,10 +98,10 @@ The `identifier` is an opaque string chosen by the host (a user ID, team ID, acc
 Rules:
 
 - The `identifier` is required only to run the **lottery** layer. If it is absent or empty, the lottery layer MUST be skipped (treated as "no match") and resolution falls through to the default. The SDK MUST NOT throw.
-- **Triggers do not use the identifier.** They are global and evaluate regardless of whether an identifier is supplied (Section 5.1). An aspect with an active trigger override resolves even when no identifier is passed.
+- **Overrides do not use the identifier.** When `aspect.overridden` is true the value is forced regardless of whether an identifier is supplied (Section 5.1). An overridden aspect resolves even when no identifier is passed.
 - The identifier is an opaque string. The SDK MUST NOT normalise, trim, lowercase, or otherwise transform it. `"User-1"` and `"user-1"` are different identifiers. The lottery seed is built from the raw string (Section 6).
 
-Triggers take **no** runtime input — their active state lives entirely in the payload (see Section 5.1). The host does not pass trigger state in.
+The override marker takes **no** runtime input; its state lives entirely in the payload (see Section 5.1). The host does not pass override state in.
 
 ---
 
@@ -109,16 +109,15 @@ Triggers take **no** runtime input — their active state lives entirely in the 
 
 To resolve aspect `A` for a host-supplied `identifier` (which may be absent):
 
-### 5.1 Triggers (global overrides)
+### 5.1 Override (forced value)
 
-`config.triggers` is an array, **ordered by priority** (index 0 is highest). Iterate it in order. For each trigger:
+If `aspect.overridden` is `true`, the aspect is pinned to a forced value. **Return `aspect.default` immediately** and report the deciding layer as `override` (Section 11). Do not run the lottery.
 
-1. If `trigger.active` is `false`, skip it.
-2. If `trigger.aspects` contains a key equal to `A`'s slug, **return that value immediately**.
+When the backend pins an aspect it sets `default` to the forced value and omits `lottery`, so even an SDK that ignored the flag would return the forced value via the default layer. Checking the flag first makes the override authoritative (it wins even if a `lottery` is erroneously present) and lets telemetry distinguish a forced value from one that merely fell through to its baseline default.
 
-The first active trigger that overrides `A` wins. Triggers are global: they apply to every evaluation regardless of the supplied identifier (or its absence). If no active trigger overrides `A`, fall through.
+If `overridden` is absent or `false`, fall through.
 
-> A trigger's `active` flag is the only thing that gates it, and it is part of the published payload. Flipping a trigger is a publish operation, not a runtime call. This is what makes triggers usable as a kill-switch: publish `active: true` and every SDK forces the override on its next config load.
+> There is no trigger object, priority list, or runtime input in the SDK. The override is decided entirely in the backend. "Flipping" it is a publish operation: the backend republishes the aspect with `overridden: true`, the forced value in `default`, and no `lottery`. Every SDK picks it up on its next config load. This is what makes it usable as a kill-switch.
 
 ### 5.2 Lottery (deterministic rollout)
 
@@ -140,10 +139,6 @@ Return `aspect.default`. Every aspect declares one; this layer always produces a
     "algorithm": "sha256_mod10000",
     "seed_format": "{identifier}:{aspect_slug}"
   },
-  "triggers": [
-    { "slug": "incident-freeze", "active": false,
-      "aspects": { "new-checkout": false } }
-  ],
   "aspects": {
     "new-checkout": {
       "type": "boolean",
@@ -159,10 +154,21 @@ Return `aspect.default`. Every aspect declares one; this layer always produces a
 }
 ```
 
-- Identifier `user-789` → trigger inactive → lottery (Section 6 shows `user-789:new-checkout` → point 7064 → bucket index 1) → **`true`**.
-- Identifier `user-123` → trigger inactive → lottery (`user-123:new-checkout` → point 1515 → bucket index 0) → **`false`**.
-- No identifier supplied → trigger inactive → lottery skipped → default → **`false`**.
-- Any of the above with `incident-freeze.active = true` → trigger overrides → **`false`** for everyone, identifier irrelevant.
+- Identifier `user-789` → not overridden → lottery (Section 6 shows `user-789:new-checkout` → point 7064 → bucket index 1) → **`true`**.
+- Identifier `user-123` → not overridden → lottery (`user-123:new-checkout` → point 1515 → bucket index 0) → **`false`**.
+- No identifier supplied → not overridden → lottery skipped → default → **`false`**.
+
+To force `new-checkout` off for everyone (e.g. an incident kill-switch), the backend republishes the aspect with the lottery stripped and the value pinned:
+
+```jsonc
+"new-checkout": {
+  "type": "boolean",
+  "default": false,
+  "overridden": true
+}
+```
+
+Now every context resolves to **`false`** via the `override` layer, identifier irrelevant and the lottery gone.
 
 ---
 
@@ -278,7 +284,7 @@ Required behaviour by failure:
 | Unknown aspect slug | Return caller's `fallback`. |
 | Type mismatch at accessor | Return caller's `fallback`, surface error (Section 7). |
 | Unknown lottery `algorithm` | Skip lottery layer, fall through to default, surface error (Section 6.1). |
-| Missing `identifier` | Skip the lottery layer, fall through to default; triggers still apply (they are global). Surface a usage error (Section 4). |
+| Missing `identifier` | Skip the lottery layer, fall through to default; an `overridden` aspect still resolves to its forced value. Surface a usage error (Section 4). |
 
 There are two distinct "defaults" and they MUST NOT be conflated:
 
@@ -293,13 +299,15 @@ The SDK SHOULD validate the full payload against the JSON Schema at load time (S
 
 How an SDK obtains the payload. A production SDK MUST implement a fetch-and-cache loop; the evaluation core (Sections 3–8) does not depend on it.
 
-- **Transport**: the SDK MUST fetch the published payload over HTTPS from the configured Astrel config endpoint. It MUST verify TLS.
+- **Transport**: the SDK MUST fetch the published payload over HTTPS from the configured Astrel config endpoint (a CDN-backed URL). It MUST verify TLS. The payload is a static, cacheable object at the CDN edge, so the SDK SHOULD lean on edge caching rather than hitting an origin on every poll.
 - **Validation on ingest**: every fetched payload MUST be validated (schema version per Section 3; full JSON Schema validation SHOULD be done) before it replaces the active config. An invalid payload MUST be discarded and the previous good config retained.
 - **Caching / conditional requests**: the SDK SHOULD use HTTP caching validators (`ETag` / `If-None-Match`, or `Last-Modified` / `If-Modified-Since`) and treat `304 Not Modified` as "no change". This keeps polling cheap.
-- **Refresh**: the SDK SHOULD poll on a configurable interval (a sane default, e.g. 30–60s, documented per SDK). It MAY support an explicit `refresh()` call and MAY support push/streaming if the platform offers it.
+- **Polling**: a production SDK MUST re-fetch the payload from the CDN on a recurring schedule so config changes propagate without a host restart. The interval MUST be configurable with a documented sane default (e.g. 30–60s). The poll loop MUST run on a background timer, MUST NOT block evaluation, and MUST start after init and stop on shutdown (Section 10). Each poll SHOULD send conditional-request validators (per the caching bullet) so an unchanged payload costs only a cheap `304` at the CDN edge. The SDK SHOULD apply small random jitter to the interval (e.g. ±10–20%) so a fleet of instances does not synchronise into a thundering herd against the CDN. It MAY additionally expose an explicit `refresh()` for on-demand fetches and MAY support push/streaming where the platform offers it, but the interval poll is the baseline and MUST exist.
 - **Backoff**: on fetch failure the SDK MUST back off (exponential with jitter SHOULD be used) and MUST keep serving the last-known-good config meanwhile. Transient fetch failures MUST NOT clear loaded config.
 - **Offline / cold start**: the SDK SHOULD persist the last-known-good payload to local storage so a restart with no network still evaluates against the last good config rather than only caller fallbacks. On first ever run with no network and no cache, all accessors return caller fallbacks.
 - **Atomicity**: see Section 10 — a new payload MUST be swapped in atomically.
+
+Only the **config payload** is polled. The JSON Schema itself (the pinned `/v1/` contract, Section 3) is a build-time dependency and MUST NOT be re-fetched on the poll loop; a new schema major is adopted by shipping a new SDK build, not by polling a "latest" URL.
 
 `published_at` is informational provenance. The SDK MAY expose it and MAY use it to ignore an older payload than the one currently loaded, but MUST NOT use it for cache freshness in place of HTTP validators.
 
@@ -321,7 +329,7 @@ How an SDK obtains the payload. A production SDK MUST implement a fetch-and-cach
 
 To measure rollouts, SDKs report **exposure events**: a record that a given context was exposed to a given resolved value, and which layer decided it.
 
-- The SDK SHOULD emit an exposure event each time an aspect is evaluated for a context. An exposure event MUST include at least: aspect slug, resolved value (or a stable digest of it), the deciding layer (`trigger` | `lottery` | `default`), the identifier used (if any), and a timestamp. When the layer is `trigger` it SHOULD include the trigger slug; when `lottery`, the selected bucket index.
+- The SDK SHOULD emit an exposure event each time an aspect is evaluated for a context. An exposure event MUST include at least: aspect slug, resolved value (or a stable digest of it), the deciding layer (`override` | `lottery` | `default`), the identifier used (if any), and a timestamp. When the layer is `lottery` it SHOULD include the selected bucket index.
 - Emission MUST be non-blocking and MUST NOT affect the resolved value. Telemetry failure MUST NOT fail evaluation.
 - The SDK SHOULD batch and flush exposures on an interval and on shutdown, with bounded buffering and a drop policy under backpressure (dropping telemetry is always preferable to blocking the host or growing memory unboundedly).
 - The SDK SHOULD de-duplicate repeated identical exposures within a window to control volume, and SHOULD make this configurable.
@@ -361,16 +369,17 @@ Vectors live in this repo (proposed `vectors/`) as JSON so any language can load
 {
   "payload": { "schema_version": 1, "published_at": "2026-06-13T10:00:00Z", "...": "..." },
   "cases": [
-    { "aspect": "new-checkout", "identifier": "user-789", "expected": true,  "via": "lottery", "bucket": 1 },
-    { "aspect": "new-checkout", "identifier": "user-123", "expected": false, "via": "lottery", "bucket": 0 },
-    { "aspect": "new-checkout", "identifier": "",         "expected": false, "via": "default" }
+    { "aspect": "killed-feature", "identifier": "anyone",   "expected": false, "via": "override" },
+    { "aspect": "new-checkout",   "identifier": "user-789", "expected": true,  "via": "lottery", "bucket": 1 },
+    { "aspect": "new-checkout",   "identifier": "user-123", "expected": false, "via": "lottery", "bucket": 0 },
+    { "aspect": "new-checkout",   "identifier": "",         "expected": false, "via": "default" }
   ]
 }
 ```
 
 ### 12.2 Required coverage
 
-The suite MUST include cases for: each layer winning in isolation; trigger priority (a lower-priority active trigger NOT overriding a higher one); inactive triggers being skipped; a trigger resolving with no identifier supplied (triggers are global); missing identifier skipping the lottery and falling through to default; lottery bucket-boundary cases (a `point` of exactly `0`, exactly one below a boundary, and exactly on a boundary); each aspect `type`; type-mismatch falling back; unknown slug falling back; unknown lottery algorithm failing safe; and `schema_version` too-new being rejected.
+The suite MUST include cases for: each layer winning in isolation; an overridden aspect returning its forced value and skipping the lottery; an overridden aspect resolving with no identifier supplied; missing identifier skipping the lottery and falling through to default; lottery bucket-boundary cases (a `point` of exactly `0`, exactly one below a boundary, and exactly on a boundary); each aspect `type`; type-mismatch falling back; unknown slug falling back; unknown lottery algorithm failing safe; and `schema_version` too-new being rejected.
 
 ### 12.3 Boundary cases worth pinning explicitly
 
@@ -419,7 +428,7 @@ Flag for the Astrel platform team before SDKs ship:
 
 1. **Config endpoint & auth** — Section 9 assumes HTTPS fetch with an SDK key. The exact endpoint, auth scheme (header? query? signed?), and whether configs are per-environment/per-project need pinning.
 2. **Exposure wire format** — Section 11 defines the required fields; the exact event schema and ingestion endpoint are not yet specified.
-3. **Trigger model confirmation** — this spec treats triggers as global, payload-gated overrides with no runtime targeting input (confirmed for v1). If triggers ever need per-context targeting, that is a schema change, not an SDK change.
+3. **Override provenance** — the payload exposes only a boolean `overridden`; it does not say *why* an aspect is pinned (which incident, who pinned it, when). If hosts need that provenance for audit or telemetry, it must be added to the schema or carried out-of-band. Confirm the bare boolean is enough for v1.
 4. **Number precision policy** — confirm whether `number` aspects are always JSON doubles or whether integer aspects need a distinct contract for languages that care.
 5. **Default poll interval & SLA** — Section 9 suggests 30–60s; the platform should set the canonical default and any rate limits.
 ```
